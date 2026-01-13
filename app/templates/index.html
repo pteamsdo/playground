@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Modular Admin Dashboard</title>
+    
+    <!-- LIBRARIES -->
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/index.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/regular/style.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.15.3/dist/cdn.min.js" defer></script>
+
+    <!-- 1. CLIENT-SIDE WIDGET STORE (Sync Script) -->
+    <script>
+        window.Store = {
+            key: 'app_widgets_v1',
+            widgets: [],
+
+            init() {
+                const stored = localStorage.getItem(this.key);
+                if (stored) {
+                    try {
+                        this.widgets = JSON.parse(stored);
+                    } catch(e) {
+                        console.error("Corrupt store, resetting", e);
+                        this.widgets = [];
+                    }
+                }
+            },
+
+            getAll() { return this.widgets; },
+            save() { localStorage.setItem(this.key, JSON.stringify(this.widgets)); },
+            reset() { this.widgets = []; this.save(); },
+            
+            add(widget) {
+                if(!widget.id) widget.id = crypto.randomUUID();
+                this.widgets.push(widget);
+                this.save();
+            },
+            
+            update(id, updates) {
+                const idx = this.widgets.findIndex(w => w.id === id);
+                if (idx > -1) {
+                    this.widgets[idx] = { ...this.widgets[idx], ...updates };
+                    this.save();
+                }
+            },
+            
+            delete(id) {
+                this.widgets = this.widgets.filter(w => w.id !== id);
+                this.save();
+            }
+        };
+
+        window.Store.init();
+    </script>
+
+    <!-- 2. APP MODULES & DB ENGINE (Async Module) -->
+    <script type="module">
+        import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm";
+        import DBInterface from '/static/js/db_interface.js';
+        import DemoData from '/static/js/demo.js';
+
+        window.DBInterface = DBInterface;
+
+        const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
+
+        window.DB = {
+            conn: null,
+            db: null,
+            ready: false,
+
+            async init() {
+                if (this.ready) return;
+                console.log("[DB] Initializing DuckDB-WASM...");
+
+                try {
+                    const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES);
+                    const worker = await duckdb.createWorker(bundle.mainWorker);
+                    const logger = new duckdb.ConsoleLogger();
+                    
+                    this.db = new duckdb.AsyncDuckDB(logger, worker);
+                    await this.db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+                    
+                    await this.loadFromCache();
+
+                    this.conn = await this.db.connect();
+                    this.ready = true;
+                    
+                    await this.checkAndSeed();
+                    window.dispatchEvent(new CustomEvent('db-ready'));
+                    console.log("[DB] Ready.");
+                } catch (err) {
+                    console.error("[DB] Initialization Failed:", err);
+                }
+            },
+
+            async loadFromCache() {
+                try {
+                    const response = await fetch('/app.duckdb');
+                    if (!response.ok) throw new Error("No cached DB found");
+                    const buffer = await response.arrayBuffer();
+                    await this.db.registerFileBuffer('app.duckdb', new Uint8Array(buffer));
+                    await this.db.open({ path: 'app.duckdb' });
+                    console.log("[DB] Loaded 'app.duckdb' from Cache.");
+                } catch (e) {
+                    console.warn("[DB] Cache load skipped/failed (Using fresh memory DB).", e);
+                }
+            },
+
+            async query(sql) {
+                if (!this.ready) await this.init();
+                const arrowResult = await this.conn.query(sql);
+                
+                // Convert Arrow structure to clean Array of Objects
+                const rawRows = arrowResult.toArray().map(r => r.toJSON());
+                
+                return rawRows.map(row => {
+                    const cleanRow = {};
+                    for (const [key, val] of Object.entries(row)) {
+                        
+                        // CASE 1: BigInt (Native JS)
+                        if (typeof val === 'bigint') {
+                            cleanRow[key] = Number(val);
+                        } 
+                        // CASE 2: HugeInt (Uint32Array from Arrow) - The source of your issue
+                        else if (val instanceof Uint32Array) {
+                            // If it has 2 elements, it's 64-bit. If 4 elements, it's 128-bit.
+                            // We construct a BigInt from the chunks (Little Endian)
+                            // Note: We only care about the lower 53 bits for JS Number safety, 
+                            // but constructing the BigInt first is safer.
+                            
+                            let bigVal = 0n;
+                            // Reconstruct BigInt from 32-bit chunks
+                            for (let i = val.length - 1; i >= 0; i--) {
+                                bigVal = (bigVal << 32n) | BigInt(val[i]);
+                            }
+                            cleanRow[key] = Number(bigVal);
+                        }
+                        // CASE 3: String artifacts (e.g. "\"5500\"")
+                        else if (typeof val === 'string' && val.startsWith('"') && val.endsWith('"') && val.length >= 2) {
+                            const unquoted = val.slice(1, -1);
+                            const num = Number(unquoted);
+                            cleanRow[key] = isNaN(num) ? unquoted : num;
+                        }
+                        // CASE 4: Standard value
+                        else {
+                            cleanRow[key] = val;
+                        }
+                    }
+                    return cleanRow;
+                });
+            },
+            
+            async checkAndSeed() {
+                const tables = await this.query(DBInterface.getPublicTables());
+                if (tables.length === 0) {
+                    console.log("[DB] Empty DB detected. Seeding demo data...");
+                    await DemoData.seedDB(this.conn);
+                    if (window.Store.getAll().length === 0) {
+                        DemoData.seedWidgets(window.Store);
+                    }
+                }
+            }
+        };
+
+        window.addEventListener('load', async () => {
+            if ('serviceWorker' in navigator) {
+                try {
+                    await navigator.serviceWorker.register('/sw.js');
+                    await navigator.serviceWorker.ready;
+                } catch(e) { console.error("SW Fail:", e); }
+            }
+            await window.DB.init();
+        });
+    </script>
+
+    <!-- 3. DASHBOARD LOGIC (Alpine) -->
+    <script>
+        document.addEventListener('alpine:init', () => {
+            Alpine.data('dashboardApp', () => ({
+                currentView: '',
+                widgets: [],
+                editMode: false,
+                showAddModal: false,
+                editingId: null,
+                charts: {},
+                newWidgetForm: {},
+
+                async init() {
+                    this.widgets = window.Store.getAll();
+                    await this.loadView('home');
+                    window.addEventListener('db-ready', () => this.refreshWidgetsData());
+                },
+
+                async loadView(viewName) {
+                    if (this.currentView === viewName) return;
+                    this.currentView = viewName;
+                    try {
+                        const res = await fetch('/views/' + viewName);
+                        if (!res.ok) throw new Error('View not found');
+                        const html = await res.text();
+                        document.getElementById('main-content').innerHTML = html;
+                        
+                        if (viewName === 'home') {
+                            this.widgets = window.Store.getAll();
+                            this.$nextTick(() => { 
+                                this.renderCharts(); 
+                                if (window.DB && window.DB.ready) this.refreshWidgetsData();
+                            });
+                        }
+                    } catch (e) { console.error(e); }
+                },
+
+                async refreshWidgetsData() {
+                    if (!window.DB || !window.DB.ready) return;
+                    
+                    for (let w of this.widgets) {
+                        if (w.content.query) {
+                            try {
+                                const res = await window.DB.query(w.content.query);
+                                
+                                if (res.length > 0) {
+                                    const row = res[0];
+                                    const keys = Object.keys(row);
+                                    
+                                    // 1. Identify Keys
+                                    let valueKey = keys.find(k => k === 'value' || k === 'val') || keys[keys.length > 1 ? 1 : 0];
+                                    let labelKey = keys.find(k => k === 'label') || keys[0];
+
+                                    if (w.type === 'metric') {
+                                        let rawVal = res[0][valueKey];
+                                        
+                                        // Smart Formatting: If old value had '$', format new value as currency
+                                        if (typeof w.content.value === 'string' && w.content.value.startsWith('$')) {
+                                            // Handle case where rawVal is "5500" string or 5500 number
+                                            let num = Number(rawVal);
+                                            if (!isNaN(num)) {
+                                                w.content.value = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(num);
+                                            } else {
+                                                w.content.value = rawVal;
+                                            }
+                                        } else {
+                                            w.content.value = rawVal;
+                                        }
+                                    }
+                                    else if (w.type === 'chart') {
+                                        w.content.labels = res.map(r => String(r[labelKey]));
+                                        w.content.data = res.map(r => Number(r[valueKey]));
+                                        
+                                        if(this.charts[w.id]) {
+                                            this.charts[w.id].data.labels = w.content.labels;
+                                            this.charts[w.id].data.datasets[0].data = w.content.data;
+                                            this.charts[w.id].update();
+                                        }
+                                    }
+                                }
+                            } catch(err) { console.warn("Widget query error:", w.title, err); }
+                        }
+                    }
+                },
+                
+                submitForm() {
+                    if (this.editingId) {
+                        window.Store.update(this.editingId, this.newWidgetForm);
+                    } else {
+                        window.Store.add(this.newWidgetForm);
+                    }
+                    this.widgets = window.Store.getAll();
+                    this.showAddModal = false;
+                    this.editingId = null;
+                    this.$nextTick(() => { 
+                        this.renderCharts();
+                        this.refreshWidgetsData();
+                    });
+                },
+                
+                deleteWidget(id) {
+                    if(confirm("Delete widget?")) { 
+                        window.Store.delete(id); 
+                        this.widgets = window.Store.getAll();
+                    }
+                },
+                
+                openAddModal() {
+                    this.editingId = null;
+                    this.newWidgetForm = { title: '', type: 'metric', w: 1, h: 1, content: { value: '0', subtext: 'Static' } };
+                    this.showAddModal = true;
+                },
+
+                openEditModal(w) {
+                    this.editingId = w.id;
+                    this.newWidgetForm = JSON.parse(JSON.stringify(w));
+                    this.showAddModal = true;
+                },
+
+                resizeWidget(id, dw, dh) {
+                    const w = this.widgets.find(x => x.id === id);
+                    if(!w) return;
+                    const newW = Math.max(1, Math.min(4, w.w + dw));
+                    const newH = Math.max(1, Math.min(3, w.h + dh));
+                    window.Store.update(id, {w: newW, h: newH});
+                    w.w = newW; w.h = newH;
+                    this.$nextTick(() => this.renderCharts());
+                },
+
+                renderCharts() {
+                    Object.values(this.charts).forEach(c => c.destroy());
+                    this.charts = {};
+                    this.widgets.forEach(w => {
+                        if (w.type === 'chart') {
+                            const ctx = document.getElementById('chart-' + w.id);
+                            if (ctx) {
+                                this.charts[w.id] = new Chart(ctx, {
+                                    type: w.content.chartType || 'line',
+                                    data: {
+                                        labels: w.content.labels || [],
+                                        datasets: [{
+                                            label: w.title,
+                                            data: w.content.data || [],
+                                            borderColor: '#4f46e5',
+                                            backgroundColor: 'rgba(79, 70, 229, 0.1)',
+                                            fill: true,
+                                            tension: 0.3
+                                        }]
+                                    },
+                                    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: true, grid: { display: false } }, y: { display: true, border: { display: false } } } }
+                                });
+                            }
+                        }
+                    });
+                }
+            }));
+        });
+    </script>
+    
+    <style>[x-cloak] { display: none !important; } .dashboard-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); grid-auto-rows: 180px; gap: 1.5rem; } @media (min-width: 1024px) { .dashboard-grid { grid-template-columns: repeat(4, 1fr); } }</style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans antialiased" x-data="dashboardApp()">
+    <nav class="fixed top-0 left-0 h-full w-20 bg-white border-r border-slate-200 flex flex-col items-center py-6 z-20 hidden md:flex shadow-sm">
+        <div class="mb-8 p-2 bg-indigo-600 rounded-lg text-white"><i class="ph ph-squares-four text-2xl"></i></div>
+        <div class="flex flex-col gap-6 w-full items-center">
+            <button @click="loadView('home')" class="p-3 rounded-xl transition duration-200" :class="currentView === 'home' ? 'bg-slate-100 text-indigo-600' : 'text-slate-400 hover:text-indigo-600 hover:bg-slate-100'"><i class="ph ph-house text-xl"></i></button>
+            <button @click="loadView('database')" class="p-3 rounded-xl transition duration-200" :class="currentView === 'database' ? 'bg-slate-100 text-indigo-600' : 'text-slate-400 hover:text-indigo-600 hover:bg-slate-100'"><i class="ph ph-database text-xl"></i></button>
+            <button @click="loadView('tables')" class="p-3 rounded-xl transition duration-200" :class="currentView === 'tables' ? 'bg-slate-100 text-indigo-600' : 'text-slate-400 hover:text-indigo-600 hover:bg-slate-100'"><i class="ph ph-table text-xl"></i></button>
+            <button @click="loadView('settings')" class="p-3 rounded-xl transition duration-200" :class="currentView === 'settings' ? 'bg-slate-100 text-indigo-600' : 'text-slate-400 hover:text-indigo-600 hover:bg-slate-100'"><i class="ph ph-gear text-xl"></i></button>
+        </div>
+    </nav>
+    <main class="md:ml-20 p-6 md:p-10 min-h-screen"><div id="main-content"></div></main>
+
+    <!-- MODAL -->
+    <div x-show="showAddModal" class="fixed inset-0 z-50 flex items-center justify-center p-4" x-cloak>
+        <div class="absolute inset-0 bg-black/30 backdrop-blur-sm" @click="showAddModal = false"></div>
+        <div class="bg-white rounded-2xl shadow-xl w-full max-w-md relative z-10 p-6">
+            <h2 class="text-xl font-bold text-slate-800 mb-4" x-text="editingId ? 'Edit Widget' : 'Add New Widget'"></h2>
+            <form @submit.prevent="submitForm">
+                <div class="space-y-4">
+                    <div><label class="block text-sm font-medium text-slate-700 mb-1">Title</label><input type="text" x-model="newWidgetForm.title" class="w-full rounded-lg border-slate-300 border px-3 py-2" required></div>
+                    <div><label class="block text-sm font-medium text-slate-700 mb-1">Type</label><select x-model="newWidgetForm.type" :disabled="!!editingId" class="w-full rounded-lg border-slate-300 border px-3 py-2"><option value="metric">Metric Card</option><option value="chart">Chart</option><option value="text">Text Card</option></select></div>
+                    <div class="grid grid-cols-2 gap-4"><div><label class="block text-sm font-medium text-slate-700 mb-1">Width</label><select x-model="newWidgetForm.w" class="w-full rounded-lg border-slate-300 border px-3 py-2"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></div><div><label class="block text-sm font-medium text-slate-700 mb-1">Height</label><select x-model="newWidgetForm.h" class="w-full rounded-lg border-slate-300 border px-3 py-2"><option value="1">1</option><option value="2">2</option><option value="3">3</option></select></div></div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-slate-700 mb-1">SQL Query (Optional)</label>
+                        <input type="text" x-model="newWidgetForm.content.query" placeholder="SELECT SUM(sales) FROM Q3_Revenue" class="w-full rounded-lg border-slate-300 border px-3 py-2 text-sm font-mono bg-slate-50">
+                    </div>
+                </div>
+                <div class="mt-6 flex justify-end gap-3"><button type="button" @click="showAddModal = false" class="px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-lg">Cancel</button><button type="submit" class="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700">Save</button></div>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

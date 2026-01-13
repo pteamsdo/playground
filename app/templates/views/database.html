@@ -1,0 +1,120 @@
+<!-- ======================= -->
+<!-- VIEW: DATABASE (Ingest) -->
+<!-- ======================= -->
+<div x-transition class="animate-fade-in" x-data="{
+    step: 1,
+    loading: false,
+    tableName: '',
+    previewData: { headers: [], rows: [] },
+    rawText: '',
+
+    async handleFile(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        this.loading = true;
+        this.tableName = file.name.split('.')[0].replace(/\W/g, '_');
+
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            this.rawText = event.target.result;
+            this.parsePreview(this.rawText);
+            this.loading = false;
+            this.step = 2;
+        };
+        reader.readAsText(file);
+    },
+
+    parsePreview(csvText) {
+        // Simple Client-Side CSV Parser
+        const lines = csvText.trim().split('\n').slice(0, 6);
+        if (lines.length > 0) {
+            this.previewData.headers = lines[0].split(',').map(h => h.trim());
+            this.previewData.rows = lines.slice(1).map(l => l.split(',').map(c => c.trim()));
+        }
+    },
+
+    async commitToDb() {
+        if (!this.tableName || !this.rawText) return;
+        this.loading = true;
+
+        try {
+            // 1. Register file in Virtual File System
+            const fileName = 'temp_ingest.csv';
+            await window.DB.db.registerFileText(fileName, this.rawText);
+            
+            // 2. Use Generic Interface to construct SQL
+            // Note: read_csv_auto is a function call, so we pass it as the source
+            const sql = window.DBInterface.createTableAsSelect(this.tableName, `read_csv_auto('${fileName}')`);
+            
+            await window.DB.conn.query(sql);
+
+            // 3. Cleanup VFS
+            await window.DB.db.registerFileText(fileName, ''); 
+
+            this.step = 3;
+        } catch (err) {
+            alert('Import failed: ' + err.message);
+        } finally {
+            this.loading = false;
+        }
+    },
+
+    reset() {
+        this.step = 1;
+        this.tableName = '';
+        this.previewData = { headers: [], rows: [] };
+        this.rawText = '';
+    }
+}">
+    <header class="mb-8">
+        <h1 class="text-3xl font-bold text-slate-900 tracking-tight">Data Ingestion</h1>
+        <p class="text-slate-500 mt-1">Import CSV files directly into the browser database.</p>
+    </header>
+
+    <!-- STEP 1: UPLOAD -->
+    <div x-show="step === 1" class="bg-white rounded-2xl shadow-sm border border-slate-200 p-8 text-center">
+        <div class="border-2 border-dashed border-slate-300 rounded-xl p-10 hover:bg-slate-50 transition cursor-pointer relative">
+            <input type="file" @change="handleFile" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer" accept=".csv">
+            <div class="inline-flex items-center justify-center w-12 h-12 rounded-full bg-indigo-100 text-indigo-600 mb-4">
+                <i class="ph ph-upload-simple text-2xl"></i>
+            </div>
+            <h3 class="text-lg font-medium text-slate-900">Upload CSV</h3>
+            <p class="text-slate-500 mt-2 text-sm">Processing happens locally.</p>
+        </div>
+    </div>
+
+    <!-- STEP 2: PREVIEW -->
+    <div x-show="step === 2">
+        <div class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden mb-4">
+            <div class="p-4 border-b border-slate-100 bg-slate-50 font-medium">CSV Preview</div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm text-left">
+                    <thead class="text-xs text-slate-500 uppercase bg-slate-50">
+                        <tr><template x-for="h in previewData.headers"><th class="px-4 py-3" x-text="h"></th></template></tr>
+                    </thead>
+                    <tbody>
+                        <template x-for="row in previewData.rows"><tr class="border-t border-slate-50"><template x-for="c in row"><td class="px-4 py-2" x-text="c"></td></template></tr></template>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        <div class="flex gap-4 items-end">
+            <div class="flex-1">
+                <label class="block text-sm font-medium text-slate-700 mb-1">Table Name</label>
+                <input type="text" x-model="tableName" class="w-full rounded-lg border-slate-300 border px-3 py-2">
+            </div>
+            <button @click="commitToDb" class="px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 font-medium">Import Data</button>
+            <button @click="reset()" class="px-4 py-2 text-slate-500 hover:bg-slate-100 rounded-lg">Cancel</button>
+        </div>
+    </div>
+
+    <!-- STEP 3: SUCCESS -->
+    <div x-show="step === 3" class="text-center py-20">
+        <div class="w-16 h-16 rounded-full bg-green-100 text-green-600 flex items-center justify-center mx-auto mb-4"><i class="ph ph-check text-3xl"></i></div>
+        <h2 class="text-2xl font-bold text-slate-900">Import Complete</h2>
+        <button @click="reset()" class="mt-6 px-6 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700">Import Another</button>
+    </div>
+
+    <!-- LOADING -->
+    <div x-show="loading" class="fixed inset-0 bg-white/80 z-50 flex items-center justify-center"><div class="animate-spin w-10 h-10 border-4 border-indigo-600 rounded-full border-t-transparent"></div></div>
+</div>
